@@ -2,58 +2,62 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from io import StringIO
+import os
+from functools import reduce
 
 st.set_page_config(page_title="Omniscience MLB Advanced Model", layout="wide")
-st.title("Omniscience MLB Advanced Model (Multi-File, Auto-Clean)")
+st.title("Omniscience MLB Advanced Model (Robust Integration)")
 
-@st.cache_data
-def load_and_combine(files):
-    dfs = []
-    for uploaded_file in files:
+# Helper to make all column names lower, strip whitespace, and replace - with _
+def normalize_cols(df):
+    df = df.copy()
+    df.columns = [c.strip().lower().replace("-", "_").replace(" ", "_") for c in df.columns]
+    return df
+
+# Try reading the file as CSV, then Excel if that fails
+def try_read(file):
+    try:
+        df = pd.read_csv(file)
+    except Exception:
+        file.seek(0)
         try:
-            # Try reading as CSV
-            df = pd.read_csv(uploaded_file)
-            st.success(f"Loaded {uploaded_file.name} as CSV.")
-        except Exception as e_csv:
-            uploaded_file.seek(0)
-            try:
-                # Try reading as Excel
-                df = pd.read_excel(uploaded_file)
-                st.success(f"Loaded {uploaded_file.name} as Excel.")
-            except Exception as e_excel:
-                st.error(f"Could not read {uploaded_file.name}: Not a valid CSV or Excel file.")
-                continue
-        # Only keep numeric columns (drop empty or all-NaN frames)
-        if not df.empty and len(df.select_dtypes(include=[np.number]).columns) > 0:
-            dfs.append(df)
+            df = pd.read_excel(file)
+        except Exception:
+            st.error(f"Could not read {file.name}")
+            return None
+    return normalize_cols(df)
+
+# Robust join key detection
+def find_join_keys(df1, df2):
+    # Acceptable synonyms for a "player" key
+    possible_keys = [
+        ['id', 'player_id', 'playerid'],
+        ['name', 'player', 'player_name', 'last_name,_first_name', 'pitcher_name'],
+    ]
+    for keys in possible_keys:
+        for k1 in keys:
+            for k2 in keys:
+                if k1 in df1.columns and k2 in df2.columns:
+                    return k1, k2
+    # Try fuzzy: any column exactly matching in both
+    for col in df1.columns:
+        if col in df2.columns:
+            return col, col
+    return None, None
+
+def robust_merge(dfs):
+    # Start with first DataFrame
+    merged = dfs[0]
+    merge_log = []
+    for i, df in enumerate(dfs[1:], 1):
+        k1, k2 = find_join_keys(merged, df)
+        if k1 and k2:
+            prev_rows = len(merged)
+            merged = pd.merge(merged, df, how='left', left_on=k1, right_on=k2, suffixes=('', f'_df{i}'))
+            merge_log.append(f"Merged file {i+1} on '{k1}' and '{k2}' ({prev_rows} rows -> {len(merged)} rows)")
         else:
-            st.warning(f"{uploaded_file.name} has no numeric columns and was skipped.")
-    if dfs:
-        combined = pd.concat(dfs, ignore_index=True)
-        combined = combined.drop_duplicates().reset_index(drop=True)
-        return combined
-    else:
-        return pd.DataFrame()
-
-class OmniscienceModel:
-    def __init__(self):
-        self.model = xgb.XGBClassifier(
-            n_estimators=200,
-            max_depth=8,
-            learning_rate=0.05,
-            use_label_encoder=False,
-            eval_metric='logloss'
-        )
-
-    def train(self, X, y):
-        self.model.fit(X, y)
-
-    def predict_proba(self, X):
-        return self.model.predict_proba(X)[:, 1]
-
-    def feature_importances(self, features):
-        return sorted(zip(features, self.model.feature_importances_), key=lambda x: -x[1])
+            merge_log.append(f"Could NOT merge file {i+1}: no common key found. Columns: {df.columns}")
+    return merged, merge_log
 
 uploaded_files = st.file_uploader(
     "Upload your MLB metrics files (CSV or Excel, multiple allowed)", 
@@ -62,65 +66,53 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    df = load_and_combine(uploaded_files)
-    if df.empty:
-        st.error("No valid data loaded. Please check your files.")
-    else:
-        st.success(f"{len(df)} rows loaded from {len(uploaded_files)} file(s)!")
-        st.dataframe(df.head())
-
-        # Allow user to select features and (optionally) target
-        all_columns = list(df.select_dtypes(include=[np.number]).columns)
-        default_features = [col for col in all_columns if col.lower() not in ['is_home_run', 'target', 'home_run']]
-        features = st.multiselect("Select features for prediction:", all_columns, default=default_features)
-        
-        # Try to auto-detect target column
-        possible_targets = [col for col in df.columns if col.lower() in ['is_home_run', 'home_run', 'target']]
-        target = st.selectbox("Select target column (label):", ["None"] + possible_targets)
-        
-        if features and target != "None":
-            X = df[features]
-            y = df[target]
-            # Remove NaNs for modeling
-            mask = X.notnull().all(axis=1) & y.notnull()
-            X = X[mask]
-            y = y[mask]
-            if len(X) == 0:
-                st.error("No rows with complete data after cleaning. Please check your files/columns.")
-            else:
-                model = OmniscienceModel()
-                model.train(X, y)
-                st.success("Model trained on your data!")
-                preds = model.predict_proba(X)
-                df_clean = df.loc[X.index].copy()
-                df_clean['Home Run Probability'] = preds
-
-                # Recommendations based on threshold
-                df_clean['Recommendation'] = np.where(
-                    df_clean['Home Run Probability'] > 0.8, "Strong Bet",
-                    np.where(df_clean['Home Run Probability'] > 0.6, "Consider", "Avoid")
-                )
-                
-                st.write("### Detailed Recommendations")
-                for i, row in df_clean.iterrows():
-                    st.markdown(f"""
-                        **Row {i+1}**
-                        - Home Run Probability: `{row['Home Run Probability']:.2%}`
-                        - Recommendation: `{row['Recommendation']}`
-                        - {" | ".join([f"{f}: {row[f]}" for f in features])}
-                    """)
-                    st.markdown("---")
-                
-                # Feature importances
-                st.write("### Feature Importances")
-                st.table(model.feature_importances(features))
-                
-                # Download results
-                csv = df_clean.to_csv(index=False)
-                st.download_button('Download Results as CSV', csv, file_name='omniscience_predictions.csv')
-        elif features:
-            st.info("Please select a target column with binary values (1 for home run, 0 otherwise).")
+    dfs = []
+    for file in uploaded_files:
+        df = try_read(file)
+        if df is not None and not df.empty:
+            dfs.append(df)
+            st.success(f"Loaded {file.name} ({df.shape[0]} rows, {df.shape[1]} cols)")
         else:
-            st.info("Please select at least one feature column.")
+            st.error(f"File {file.name} is empty or unreadable.")
+    if len(dfs) < 2:
+        st.warning("Please upload at least 2 files with a common key for robust merging.")
+    else:
+        merged_df, merge_log = robust_merge(dfs)
+        st.write("**Merge Log:**")
+        for line in merge_log:
+            st.write("-", line)
+        st.write("**Merged Data Preview:**")
+        st.dataframe(merged_df.head(20))
+        
+        # Use only numeric columns for modeling
+        numeric_columns = list(merged_df.select_dtypes(include=[np.number]).columns)
+        if not numeric_columns:
+            st.error("No numeric columns detected in merged data. Try files with numeric stats.")
+        else:
+            features = st.multiselect("Select features for prediction:", numeric_columns)
+            target = st.selectbox("Select target column (label):", ["None"] + numeric_columns)
+            
+            if features and target != "None":
+                X = merged_df[features]
+                y = merged_df[target]
+                mask = X.notnull().all(axis=1) & y.notnull()
+                X = X[mask]
+                y = y[mask]
+                if len(X) == 0:
+                    st.error("No rows with complete data after cleaning. Please check your selected columns.")
+                else:
+                    model = xgb.XGBClassifier(n_estimators=200, max_depth=8, learning_rate=0.05, use_label_encoder=False, eval_metric='logloss')
+                    model.fit(X, y)
+                    preds = model.predict_proba(X)[:, 1]
+                    merged_df_clean = merged_df.loc[X.index].copy()
+                    merged_df_clean['Prediction'] = preds
+                    st.write("### Prediction Results (Top 20)")
+                    st.dataframe(merged_df_clean[['Prediction'] + features].head(20))
+                    st.write("### Feature Importances")
+                    st.table(sorted(zip(features, model.feature_importances_), key=lambda x: -x[1]))
+                    csv = merged_df_clean.to_csv(index=False)
+                    st.download_button('Download Results as CSV', csv, file_name='omniscience_predictions.csv')
+            else:
+                st.info("Select at least one feature and a target to train the model.")
 else:
-    st.info("Please upload your MLB metrics files to begin.")
+    st.info("Upload your MLB metrics files to begin.")
