@@ -1,11 +1,13 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import xgboost as xgb
-import difflib
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+import shap
 
-st.set_page_config(page_title="Omniscience MLB Universal Analyzer", layout="wide")
-st.title("Omniscience MLB Universal Analyzer")
+st.set_page_config(page_title="MLB Home Run Probability (Dynamic, Explainable)", layout="wide")
+st.title("MLB Home Run Probability – Dynamic, Explainable, Multi-Player Analysis")
 
 def normalize_cols(df):
     df.columns = [
@@ -21,127 +23,111 @@ def try_read(file):
             df = pd.read_csv(file, encoding=enc)
             df = normalize_cols(df)
             df = df.loc[:, ~df.columns.str.contains('^unnamed')]
-            if len(df) > 0: return df
+            if len(df) > 0:
+                return df
         except Exception:
             file.seek(0)
             try:
                 df = pd.read_excel(file, engine='openpyxl')
                 df = normalize_cols(df)
                 df = df.loc[:, ~df.columns.str.contains('^unnamed')]
-                if len(df) > 0: return df
+                if len(df) > 0:
+                    return df
             except Exception:
                 continue
     return None
 
-def find_best_key(df1, df2):
-    keys1 = set(df1.columns)
-    keys2 = set(df2.columns)
-    preferred_keys = [
-        ["id", "player_id", "playerid"],
-        ["name", "player", "player_name", "last_name,_first_name", "pitcher_name"]
-    ]
-    for group in preferred_keys:
-        for k1 in group:
-            for k2 in group:
-                if k1 in keys1 and k2 in keys2:
-                    return k1, k2
-    for c1 in keys1:
-        close = difflib.get_close_matches(c1, list(keys2), n=1, cutoff=0.9)
-        if close:
-            return c1, close[0]
-    for c in keys1:
-        if c in keys2:
-            return c, c
-    return None, None
+def find_hr_target(df):
+    hr_targets = [c for c in df.columns if any(k in c.lower() for k in ['hr', 'home_run', 'homers'])]
+    hr_targets = [c for c in hr_targets if pd.api.types.is_numeric_dtype(df[c])]
+    if not hr_targets:
+        hr_targets = [c for c in df.select_dtypes(include=np.number).columns if df[c].nunique() <= 2]
+    return hr_targets[0] if hr_targets else None
 
-def safe_merge(df1, df2):
-    k1, k2 = find_best_key(df1, df2)
-    if k1 and k2:
-        try:
-            merged = pd.merge(df1, df2, how="inner", left_on=k1, right_on=k2, suffixes=('', '_file2'))
-            return merged, f"Merged on '{k1}' and '{k2}'"
-        except Exception as e:
-            return None, f"Merge failed on '{k1}/{k2}': {e}"
-    else:
-        return None, "No common key found for merge."
+def encode_categoricals(df, feature_cols):
+    categoricals = [c for c in feature_cols if df[c].dtype == 'object']
+    if not categoricals:
+        return df[feature_cols], []
+    enc = OneHotEncoder(sparse=False, handle_unknown='ignore')
+    cats = df[categoricals].fillna('Unknown')
+    cat_encoded = enc.fit_transform(cats)
+    cat_feature_names = enc.get_feature_names_out(categoricals)
+    df_cat = pd.DataFrame(cat_encoded, columns=cat_feature_names, index=df.index)
+    numerics = [c for c in feature_cols if df[c].dtype != 'object']
+    df_all = pd.concat([df[numerics], df_cat], axis=1)
+    return df_all, cat_feature_names
 
-uploaded_files = st.file_uploader(
-    "Upload any number of MLB CSV or Excel files (even unrelated!)",
-    type=["csv", "xlsx"],
-    accept_multiple_files=True
+uploaded_file = st.file_uploader(
+    "Upload a MLB CSV or Excel file (should include a home run indicator column and as many features as you want)", 
+    type=["csv", "xlsx"]
 )
 
-file_dfs = []
-file_names = []
-for file in uploaded_files:
-    df = try_read(file)
+if uploaded_file:
+    df = try_read(uploaded_file)
     if df is not None and not df.empty:
-        file_dfs.append(df)
-        file_names.append(file.name)
-        st.success(f"Loaded {file.name} ({df.shape[0]} rows, {df.shape[1]} cols)")
-    else:
-        st.warning(f"File {file.name} could not be loaded or is empty.")
+        st.success(f"Loaded {uploaded_file.name}: {df.shape[0]} rows, {df.shape[1]} cols")
+        st.dataframe(df.head(20))
 
-if len(file_dfs) == 0:
-    st.info("Upload any MLB data files to begin (no need for them to be related).")
-else:
-    st.header("File Selection & Analysis")
-    chosen_file_idx = st.selectbox("Select a file to analyze", list(range(len(file_names))), format_func=lambda i: file_names[i])
-    chosen_df = file_dfs[chosen_file_idx]
-    st.write(f"**Preview of {file_names[chosen_file_idx]}:**")
-    st.dataframe(chosen_df.head(20))
-    st.write("**Summary Statistics:**")
-    st.write(chosen_df.describe(include='all'))
-
-    if chosen_df.select_dtypes(include=[np.number]).shape[1] > 0:
-        st.write("**Numeric Histograms:**")
-        for col in chosen_df.select_dtypes(include=[np.number]).columns:
-            st.bar_chart(chosen_df[col].dropna())
-        st.write("**Correlation Matrix:**")
-        st.dataframe(chosen_df.corr(numeric_only=True))
-
-    # Option to try merging files
-    if len(file_dfs) > 1:
-        st.subheader("Optional: Merge Two Files for Modeling")
-        merge1 = st.selectbox("Select first file for merge", list(range(len(file_names))), format_func=lambda i: file_names[i], key="merge1")
-        merge2 = st.selectbox("Select second file for merge", list(range(len(file_names))), format_func=lambda i: file_names[i], key="merge2")
-        if merge1 != merge2:
-            merged_df, merge_log = safe_merge(file_dfs[merge1], file_dfs[merge2])
-            st.write(f"**Merge Attempt:** {merge_log}")
-            if merged_df is not None and not merged_df.empty:
-                st.dataframe(merged_df.head(20))
-                chosen_df = merged_df # Allow using this for modeling below
-        
-    # Modeling on any file
-    st.header("Model Training & Prediction")
-    numeric_cols = list(chosen_df.select_dtypes(include=[np.number]).columns)
-    if not numeric_cols:
-        st.error("No numeric columns detected for modeling in selected data.")
-    else:
-        features = st.multiselect("Select features for model:", numeric_cols, default=numeric_cols[:min(len(numeric_cols), 5)])
-        target = st.selectbox("Select target column (label):", ["None"] + numeric_cols)
-        if features and target != "None":
-            try:
-                X = chosen_df[features]
-                y = chosen_df[target]
-                mask = X.notnull().all(axis=1) & y.notnull()
-                X = X[mask]
-                y = y[mask]
-                if len(X) == 0:
-                    st.error("No rows with complete data after cleaning. Please check your selected columns.")
-                else:
-                    model = xgb.XGBClassifier(n_estimators=200, max_depth=8, learning_rate=0.05, use_label_encoder=False, eval_metric='logloss')
-                    model.fit(X, y)
-                    preds = model.predict_proba(X)[:, 1]
-                    result_df = chosen_df.loc[X.index].copy()
-                    result_df['Prediction'] = preds
-                    st.write("### Prediction Results (Top 20 rows)")
-                    st.dataframe(result_df[['Prediction'] + features].head(20))
-                    st.write("### Feature Importances")
-                    st.table(sorted(zip(features, model.feature_importances_), key=lambda x: -x[1]))
-                    csv = result_df.to_csv(index=False)
-                    st.download_button('Download these results as CSV', csv, file_name='omniscience_predictions.csv')
-            except Exception as e:
-                st.error(f"Modeling failed: {e}")
+        target_col = find_hr_target(df)
+        if not target_col:
+            st.error("Could not find any suitable home run column. Please include a binary HR indicator like 'hr', 'home_run', or 'homers'.")
         else:
-            st.info("Select at least one feature and a target to train the model.")
+            st.info(f"Using column '{target_col}' as the home run target variable.")
+            feature_cols = [c for c in df.columns if c != target_col]
+            X, cat_feats = encode_categoricals(df, feature_cols)
+            mask = X.notnull().all(axis=1) & df[target_col].notnull()
+            X = X[mask]
+            y = df.loc[mask, target_col]
+            show_n = st.slider("Show top N predictions", min_value=1, max_value=min(30, X.shape[0]), value=5)
+            # Train/test split to avoid overfitting explanations
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
+            model = XGBClassifier(n_estimators=200, max_depth=8, learning_rate=0.05, use_label_encoder=False, eval_metric='logloss')
+            model.fit(X_train, y_train)
+            probs = model.predict_proba(X_test)[:, 1]
+            confidences = 1 - 2 * np.abs(probs - 0.5)
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_test)
+            results = pd.DataFrame(X_test, columns=X.columns)
+            results['probability'] = probs
+            results['confidence'] = confidences
+            # Try to include player or batter name column for display, else just index
+            id_col = None
+            for c in df.columns:
+                if any(k in c.lower() for k in ['batter', 'player', 'name', 'hitter']):
+                    id_col = c
+                    break
+            if id_col and id_col in df.columns:
+                results[id_col] = df.loc[X_test.index, id_col].values
+            # Show top N
+            top_idx = np.argsort(results['probability'])[-show_n:][::-1]
+            st.subheader(f"Top {show_n} Home Run Probabilities")
+            st.dataframe(results.iloc[top_idx][[id_col, 'probability', 'confidence']] if id_col else results.iloc[top_idx][['probability', 'confidence']])
+            # Detailed pros & cons
+            st.subheader("Detailed Analysis (Pros & Cons for Top N)")
+            for i, idx in enumerate(top_idx):
+                row = results.iloc[idx]
+                st.markdown(f"**{i+1}. {row.get(id_col, f'Row {idx}')}** — Probability: `{row['probability']:.3f}`, Confidence: `{row['confidence']:.2f}`")
+                sv = shap_values[idx]
+                # Top 2 pros (features boosting), top 2 cons (features lowering)
+                top_pos = np.argsort(sv)[-2:][::-1]
+                top_neg = np.argsort(sv)[:2]
+                st.write("Pros (features boosting HR probability):")
+                for j in top_pos:
+                    feat = X.columns[j]
+                    st.write(f"  + **{feat}** (value: `{row[feat]}`, impact: `{sv[j]:.2f}`)")
+                st.write("Cons (features lowering HR probability):")
+                for j in top_neg:
+                    feat = X.columns[j]
+                    st.write(f"  - **{feat}** (value: `{row[feat]}`, impact: `{sv[j]:.2f}`)")
+                st.write("---")
+            # Global feature importance
+            st.subheader("Global Feature Importance (Top 10)")
+            importances = model.feature_importances_
+            feat_imp = sorted(zip(X.columns, importances), key=lambda x: -x[1])[:10]
+            st.table(pd.DataFrame(feat_imp, columns=['Feature', 'Importance']))
+            # Download results
+            st.download_button('Download all predictions', results.to_csv(index=False), file_name='home_run_probabilities.csv')
+    else:
+        st.error(f"File {uploaded_file.name} could not be loaded or is empty.")
+else:
+    st.info("Upload a MLB data file to begin.")
